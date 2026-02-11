@@ -1,11 +1,16 @@
 // =========================
 // Config
 // =========================
-// Local dev (Flask running on 127.0.0.1:5000):
-const API_BASE = "http://127.0.0.1:5000";
-
-// After deploying backend (Render), change to:
-// const API_BASE = "https://YOUR-SERVICE.onrender.com";
+// =========================
+// Config
+// =========================
+// Auto switch:
+// - Local dev: Flask on http://127.0.0.1:5000
+// - Deployed frontend (GitHub Pages): backend on Render (https)
+const API_BASE =
+  window.location.hostname === "127.0.0.1" || window.location.hostname === "localhost"
+    ? "http://127.0.0.1:5000"
+    : "https://ai-chatbot-ui-ibps.onrender.com";
 
 // =========================
 // UI wiring
@@ -74,7 +79,10 @@ async function getChatGPTReply(message) {
   if (!res.ok) {
     if (contentType.includes("application/json")) {
       const data = await res.json();
-      return { mode: "full", text: data.error ? `Error: ${data.error}` : "Server error." };
+      return {
+        mode: "full",
+        text: data.error ? `Error: ${data.error}` : "Server error.",
+      };
     }
     return { mode: "full", text: `Server error (${res.status})` };
   }
@@ -124,4 +132,3 @@ async function getChatGPTReply(message) {
     },
   };
 }
-
