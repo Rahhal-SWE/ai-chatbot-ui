@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 from datetime import datetime
-from typing import Any, Dict, Generator, Optional
 
 import pytz
 import requests
@@ -10,40 +9,16 @@ from flask import Flask, Response, jsonify, request, send_from_directory
 from flask_cors import CORS
 from google import genai
 
-# -----------------------------
-# Flask setup
-# -----------------------------
-# Repo layout:
-# repo/
-#   index.html
-#   script.js
-#   style.css
-#   server/
-#     __init__.py
-#     app.py
-#
-# Serve UI files from repo root ("..")
+# Serve UI from repo root (index.html, script.js, style.css)
 app = Flask(__name__, static_folder="..", static_url_path="")
 CORS(app, resources={r"/api/*": {"origins": "*"}})
 
-# -----------------------------
-# Config
-# -----------------------------
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
-GALWAY_LAT = 53.2707
-GALWAY_LON = -9.0568
-GALWAY_TZ = "Europe/Dublin"
-
-# -----------------------------
-# Lazy Gemini client (IMPORTANT for CI)
-# -----------------------------
-_client: Optional[genai.Client] = None
-
+_client = None
 
 def get_gemini_client() -> genai.Client:
     """
-    Create Gemini client lazily. This prevents CI from failing on `import server.app`
-    when no API key exists in the environment.
+    Create Gemini client lazily so imports don't fail in CI.
+    Requires GEMINI_API_KEY in environment.
     """
     global _client
     if _client is not None:
@@ -51,173 +26,119 @@ def get_gemini_client() -> genai.Client:
 
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
-        # Don't crash on import; only raise when an endpoint actually needs Gemini.
-        raise RuntimeError("Missing GEMINI_API_KEY environment variable.")
+        raise RuntimeError("Missing GEMINI_API_KEY environment variable")
 
     _client = genai.Client(api_key=api_key)
     return _client
 
 
-# -----------------------------
-# Weather helper (Open-Meteo) with tiny cache
-# -----------------------------
-_weather_cache: Dict[str, Any] = {"ts": 0.0, "value": None}
+# --- Simple weather helper (Open-Meteo is free) ---
+_weather_cache = {"ts": 0.0, "value": None}
 
+def get_galway_time_and_weather() -> dict:
+    tz = pytz.timezone("Europe/Dublin")
+    now = datetime.now(tz)
 
-def get_galway_time_weather() -> Dict[str, Any]:
-    """
-    Returns Galway local time + current weather via Open-Meteo.
-    Cached for 60s to reduce calls.
-    """
-    now = time.time()
-    if _weather_cache["value"] is not None and (now - _weather_cache["ts"] < 60):
-        return _weather_cache["value"]
-
-    tz = pytz.timezone(GALWAY_TZ)
-    local_now = datetime.now(tz)
-
+    # Galway coordinates
     url = "https://api.open-meteo.com/v1/forecast"
     params = {
-        "latitude": GALWAY_LAT,
-        "longitude": GALWAY_LON,
+        "latitude": 53.2707,
+        "longitude": -9.0568,
         "current": "temperature_2m,precipitation,wind_speed_10m",
-        "timezone": GALWAY_TZ,
+        "timezone": "Europe/Dublin",
     }
 
-    weather: Dict[str, Any] = {}
     try:
         r = requests.get(url, params=params, timeout=10)
         r.raise_for_status()
         data = r.json()
         cur = data.get("current") or {}
-        weather = {
+        return {
+            "time": now.strftime("%A, %d %B %Y %H:%M (%Z)"),
             "temperature_c": cur.get("temperature_2m"),
-            "precip_mm": cur.get("precipitation"),
             "wind_kmh": cur.get("wind_speed_10m"),
-            "obs_time": cur.get("time"),
+            "precip_mm": cur.get("precipitation"),
         }
     except Exception:
-        weather = {"error": "weather_fetch_failed"}
-
-    result = {
-        "city": "Galway",
-        "timezone": GALWAY_TZ,
-        "local_time": local_now.strftime("%A, %d %B %Y %H:%M (%Z)"),
-        "weather": weather,
-    }
-
-    _weather_cache["ts"] = now
-    _weather_cache["value"] = result
-    return result
+        # Still return time even if weather fails
+        return {
+            "time": now.strftime("%A, %d %B %Y %H:%M (%Z)"),
+            "temperature_c": None,
+            "wind_kmh": None,
+            "precip_mm": None,
+        }
 
 
-def maybe_handle_time_weather(user_text: str) -> Optional[str]:
-    """
-    If user asks about Galway time/weather, answer directly (no Gemini call).
-    """
-    t = user_text.lower()
-    if "galway" in t and ("weather" in t or "time" in t):
-        info = get_galway_time_weather()
-        w = info["weather"]
-        if "error" in w:
-            return (
-                f"The time in Galway is {info['local_time']}. "
-                f"I couldn’t fetch live weather right now."
-            )
-
-        return (
-            f"The time in Galway is {info['local_time']}. "
-            f"Current weather: {w.get('temperature_c')}°C, "
-            f"wind {w.get('wind_kmh')} km/h, precipitation {w.get('precip_mm')} mm."
-        )
-    return None
-
-
-# -----------------------------
-# Routes: UI
-# -----------------------------
-@app.get("/")
-def index() -> Any:
-    return send_from_directory("..", "index.html")
-
-
-@app.get("/<path:path>")
-def static_files(path: str) -> Any:
-    return send_from_directory("..", path)
-
-
-# -----------------------------
-# Routes: API
-# -----------------------------
 @app.get("/api/health")
-def health() -> Any:
+def health():
+    # Always works even with no key (important for CI)
     return jsonify({"status": "ok"})
 
 
-@app.post("/api/chat")
-def chat() -> Any:
-    payload = request.get_json(silent=True) or {}
-    message = (payload.get("message") or "").strip()
-    if not message:
-        return jsonify({"reply": "Send a message, genius."}), 400
+@app.get("/")
+def root():
+    return send_from_directory("..", "index.html")
 
-    # Fast-path: Galway time/weather
-    direct = maybe_handle_time_weather(message)
-    if direct is not None:
-        return jsonify({"reply": direct})
+
+@app.post("/api/chat")
+def chat():
+    payload = request.get_json(silent=True) or {}
+    user_msg = (payload.get("message") or "").strip()
+    if not user_msg:
+        return jsonify({"error": "Missing 'message'"}), 400
+
+    # Add your “Galway time/weather” tool info into prompt
+    tw = get_galway_time_and_weather()
+    tool_context = (
+        f"Galway time now: {tw['time']}\n"
+        f"Weather: temp={tw['temperature_c']}C wind={tw['wind_kmh']}km/h precip={tw['precip_mm']}mm\n"
+    )
 
     try:
         client = get_gemini_client()
     except RuntimeError as e:
-        return jsonify({"reply": str(e)}), 500
+        return jsonify({"error": str(e)}), 500
 
-    response = client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=message,
-    )
-    return jsonify({"reply": response.text or ""})
+    model = os.environ.get("GEMINI_MODEL", "gemini-1.5-flash")
+
+    prompt = f"{tool_context}\nUser: {user_msg}\nAssistant:"
+
+    resp = client.models.generate_content(model=model, contents=prompt)
+    text = getattr(resp, "text", None) or str(resp)
+
+    return jsonify({"reply": text})
 
 
 @app.post("/api/chat/stream")
-def chat_stream() -> Response:
+def chat_stream():
     payload = request.get_json(silent=True) or {}
-    message = (payload.get("message") or "").strip()
-    if not message:
-        return Response("data: Missing message\n\n", mimetype="text/event-stream")
+    user_msg = (payload.get("message") or "").strip()
+    if not user_msg:
+        return jsonify({"error": "Missing 'message'"}), 400
 
-    # Fast-path: Galway time/weather (still streamed so UI behaves)
-    direct = maybe_handle_time_weather(message)
-    if direct is not None:
+    tw = get_galway_time_and_weather()
+    tool_context = (
+        f"Galway time now: {tw['time']}\n"
+        f"Weather: temp={tw['temperature_c']}C wind={tw['wind_kmh']}km/h precip={tw['precip_mm']}mm\n"
+    )
 
-        def _direct_stream() -> Generator[str, None, None]:
-            yield f"data: {direct}\n\n"
-            yield "data: [DONE]\n\n"
+    try:
+        client = get_gemini_client()
+    except RuntimeError as e:
+        return jsonify({"error": str(e)}), 500
 
-        return Response(_direct_stream(), mimetype="text/event-stream")
+    model = os.environ.get("GEMINI_MODEL", "gemini-1.5-flash")
+    prompt = f"{tool_context}\nUser: {user_msg}\nAssistant:"
 
-    def _stream() -> Generator[str, None, None]:
-        # If key missing, stream the error nicely.
+    def generate():
+        # SSE (Server-Sent Events)
         try:
-            client = get_gemini_client()
-        except RuntimeError as e:
-            yield f"data: {str(e)}\n\n"
-            yield "data: [DONE]\n\n"
-            return
+            stream = client.models.generate_content_stream(model=model, contents=prompt)
+            for chunk in stream:
+                t = getattr(chunk, "text", "")
+                if t:
+                    yield f"data: {t}\n\n"
+        except Exception as e:
+            yield f"data: [ERROR] {str(e)}\n\n"
 
-        # Gemini streaming
-        for chunk in client.models.generate_content_stream(
-            model=GEMINI_MODEL,
-            contents=message,
-        ):
-            if chunk.text:
-                # Keep it simple: plain text SSE chunks
-                yield f"data: {chunk.text}\n\n"
-
-        yield "data: [DONE]\n\n"
-
-    return Response(_stream(), mimetype="text/event-stream")
-
-
-if __name__ == "__main__":
-    # Run dev server
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    return Response(generate(), mimetype="text/event-stream")
