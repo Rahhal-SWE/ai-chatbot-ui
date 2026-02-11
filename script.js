@@ -7,10 +7,7 @@
 // Auto switch:
 // - Local dev: Flask on http://127.0.0.1:5000
 // - Deployed frontend (GitHub Pages): backend on Render (https)
-const API_BASE =
-  window.location.hostname === "127.0.0.1" || window.location.hostname === "localhost"
-    ? "http://127.0.0.1:5000"
-    : "https://ai-chatbot-ui-ibps.onrender.com";
+const API_BASE = "";
 
 // =========================
 // UI wiring
