@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from datetime import datetime
-from typing import Optional
+from typing import Any, Dict, Generator, Optional
 
 import pytz
 import requests
@@ -10,190 +10,214 @@ from flask import Flask, Response, jsonify, request, send_from_directory
 from flask_cors import CORS
 from google import genai
 
-# =========================
-# Config
-# =========================
-MODEL = os.getenv("GEMINI_MODEL", "gemini-3-flash-preview")
+# -----------------------------
+# Flask setup
+# -----------------------------
+# Repo layout:
+# repo/
+#   index.html
+#   script.js
+#   style.css
+#   server/
+#     __init__.py
+#     app.py
+#
+# Serve UI files from repo root ("..")
+app = Flask(__name__, static_folder="..", static_url_path="")
+CORS(app, resources={r"/api/*": {"origins": "*"}})
 
-# =========================
-# Gemini client (lazy init)
-# =========================
+# -----------------------------
+# Config
+# -----------------------------
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
+GALWAY_LAT = 53.2707
+GALWAY_LON = -9.0568
+GALWAY_TZ = "Europe/Dublin"
+
+# -----------------------------
+# Lazy Gemini client (IMPORTANT for CI)
+# -----------------------------
 _client: Optional[genai.Client] = None
 
 
 def get_gemini_client() -> genai.Client:
     """
-    Lazy-init Gemini client so importing this module doesn't require an API key.
-    This fixes CI "smoke import" failures.
+    Create Gemini client lazily. This prevents CI from failing on `import server.app`
+    when no API key exists in the environment.
     """
     global _client
     if _client is not None:
         return _client
 
-    api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+    api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
-        raise RuntimeError("Missing GEMINI_API_KEY (or GOOGLE_API_KEY). Set it in your environment.")
+        # Don't crash on import; only raise when an endpoint actually needs Gemini.
+        raise RuntimeError("Missing GEMINI_API_KEY environment variable.")
 
     _client = genai.Client(api_key=api_key)
     return _client
 
 
-# =========================
-# Live data helpers
-# =========================
-_weather_cache = {"ts": 0.0, "value": None}
+# -----------------------------
+# Weather helper (Open-Meteo) with tiny cache
+# -----------------------------
+_weather_cache: Dict[str, Any] = {"ts": 0.0, "value": None}
 
 
-def ireland_time_now() -> str:
-    tz = pytz.timezone("Europe/Dublin")
-    now = datetime.now(tz)
-    return now.strftime("%A, %d %B %Y %H:%M (%Z)")
-
-
-def galway_weather_now() -> str:
-    import time
-
-    # Galway city approx coordinates
-    lat, lon = 53.2707, -9.0568
-
+def get_galway_time_weather() -> Dict[str, Any]:
+    """
+    Returns Galway local time + current weather via Open-Meteo.
+    Cached for 60s to reduce calls.
+    """
     now = time.time()
     if _weather_cache["value"] is not None and (now - _weather_cache["ts"] < 60):
         return _weather_cache["value"]
 
+    tz = pytz.timezone(GALWAY_TZ)
+    local_now = datetime.now(tz)
+
     url = "https://api.open-meteo.com/v1/forecast"
     params = {
-        "latitude": lat,
-        "longitude": lon,
+        "latitude": GALWAY_LAT,
+        "longitude": GALWAY_LON,
         "current": "temperature_2m,precipitation,wind_speed_10m",
-        "timezone": "Europe/Dublin",
+        "timezone": GALWAY_TZ,
     }
 
-    r = requests.get(url, params=params, timeout=10)
-    r.raise_for_status()
-    data = r.json()
+    weather: Dict[str, Any] = {}
+    try:
+        r = requests.get(url, params=params, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        cur = data.get("current") or {}
+        weather = {
+            "temperature_c": cur.get("temperature_2m"),
+            "precip_mm": cur.get("precipitation"),
+            "wind_kmh": cur.get("wind_speed_10m"),
+            "obs_time": cur.get("time"),
+        }
+    except Exception:
+        weather = {"error": "weather_fetch_failed"}
 
-    cur = data.get("current") or {}
-    t = cur.get("temperature_2m")
-    w = cur.get("wind_speed_10m")
-    p = cur.get("precipitation")
+    result = {
+        "city": "Galway",
+        "timezone": GALWAY_TZ,
+        "local_time": local_now.strftime("%A, %d %B %Y %H:%M (%Z)"),
+        "weather": weather,
+    }
 
-    if t is None or w is None or p is None:
-        raise RuntimeError(f"Missing fields in Open-Meteo response: {cur}")
-
-    # round for clean output
-    t = round(float(t), 1)
-    w = round(float(w), 1)
-    p = round(float(p), 2)
-
-    result = f"location=Galway temperature_c={t} wind_kmh={w} precipitation_mm={p}"
     _weather_cache["ts"] = now
     _weather_cache["value"] = result
     return result
 
 
-def build_prompt_with_live_data(user_msg: str) -> str:
+def maybe_handle_time_weather(user_text: str) -> Optional[str]:
     """
-    Inject verified live data for time/weather questions.
-    Strong prompt: do not hallucinate missing facts.
+    If user asks about Galway time/weather, answer directly (no Gemini call).
     """
-    lower = user_msg.lower()
-    tool_info = ""
+    t = user_text.lower()
+    if "galway" in t and ("weather" in t or "time" in t):
+        info = get_galway_time_weather()
+        w = info["weather"]
+        if "error" in w:
+            return (
+                f"The time in Galway is {info['local_time']}. "
+                f"I couldn’t fetch live weather right now."
+            )
 
-    # time triggers
-    if "time" in lower and ("galway" in lower or "ireland" in lower):
-        tool_info += f"Ireland time now: {ireland_time_now()}\n"
-
-    # weather triggers
-    if "weather" in lower and ("galway" in lower or "ireland" in lower):
-        try:
-            tool_info += f"Live weather: {galway_weather_now()}\n"
-        except Exception as e:
-            tool_info += f"Live weather: (unavailable: {str(e).replace(chr(10), ' ')})\n"
-
-    if not tool_info:
-        return user_msg
-
-    return (
-        "You are a helpful assistant. "
-        "You MUST use only the LIVE_DATA below for time/weather facts. "
-        "If LIVE_DATA is missing something the user asked for, say you don't have it.\n\n"
-        f"LIVE_DATA:\n{tool_info}\n"
-        f"USER_QUESTION: {user_msg}\n"
-        "Answer clearly in 1-4 sentences."
-    )
+        return (
+            f"The time in Galway is {info['local_time']}. "
+            f"Current weather: {w.get('temperature_c')}°C, "
+            f"wind {w.get('wind_kmh')} km/h, precipitation {w.get('precip_mm')} mm."
+        )
+    return None
 
 
-# =========================
-# Flask app
-# =========================
-# Serve the UI (index.html, script.js, style.css) from repo root:
-# repo/
-#   index.html
-#   script.js
-#   style.css
-#   server/app.py
-app = Flask(__name__, static_folder="..", static_url_path="")
-CORS(app, resources={r"/api/*": {"origins": "*"}})
-
-
+# -----------------------------
+# Routes: UI
+# -----------------------------
 @app.get("/")
-def index():
+def index() -> Any:
     return send_from_directory("..", "index.html")
 
 
+@app.get("/<path:path>")
+def static_files(path: str) -> Any:
+    return send_from_directory("..", path)
+
+
+# -----------------------------
+# Routes: API
+# -----------------------------
 @app.get("/api/health")
-def health():
+def health() -> Any:
     return jsonify({"status": "ok"})
 
 
-# Silence Chrome devtools probe spam
-@app.get("/.well-known/appspecific/com.chrome.devtools.json")
-def chrome_devtools_noise():
-    return ("", 204)
-
-
 @app.post("/api/chat")
-def chat_once():
-    data = request.get_json(silent=True) or {}
-    user_msg = (data.get("message") or "").strip()
-    if not user_msg:
-        return jsonify({"error": "Missing 'message'"}), 400
+def chat() -> Any:
+    payload = request.get_json(silent=True) or {}
+    message = (payload.get("message") or "").strip()
+    if not message:
+        return jsonify({"reply": "Send a message, genius."}), 400
 
-    prompt = build_prompt_with_live_data(user_msg)
+    # Fast-path: Galway time/weather
+    direct = maybe_handle_time_weather(message)
+    if direct is not None:
+        return jsonify({"reply": direct})
 
     try:
         client = get_gemini_client()
-        resp = client.models.generate_content(model=MODEL, contents=prompt)
-        return jsonify({"reply": resp.text or ""})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    except RuntimeError as e:
+        return jsonify({"reply": str(e)}), 500
+
+    response = client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=message,
+    )
+    return jsonify({"reply": response.text or ""})
 
 
 @app.post("/api/chat/stream")
-def chat_stream():
-    data = request.get_json(silent=True) or {}
-    user_msg = (data.get("message") or "").strip()
-    if not user_msg:
-        return jsonify({"error": "Missing 'message'"}), 400
+def chat_stream() -> Response:
+    payload = request.get_json(silent=True) or {}
+    message = (payload.get("message") or "").strip()
+    if not message:
+        return Response("data: Missing message\n\n", mimetype="text/event-stream")
 
-    prompt = build_prompt_with_live_data(user_msg)
+    # Fast-path: Galway time/weather (still streamed so UI behaves)
+    direct = maybe_handle_time_weather(message)
+    if direct is not None:
 
-    def sse():
+        def _direct_stream() -> Generator[str, None, None]:
+            yield f"data: {direct}\n\n"
+            yield "data: [DONE]\n\n"
+
+        return Response(_direct_stream(), mimetype="text/event-stream")
+
+    def _stream() -> Generator[str, None, None]:
+        # If key missing, stream the error nicely.
         try:
             client = get_gemini_client()
-            for chunk in client.models.generate_content_stream(model=MODEL, contents=prompt):
-                text = getattr(chunk, "text", None)
-                if text:
-                    yield f"data: {text}\n\n"
+        except RuntimeError as e:
+            yield f"data: {str(e)}\n\n"
             yield "data: [DONE]\n\n"
-        except Exception as e:
-            msg = str(e).replace("\n", " ")
-            yield f"data: [ERROR] {msg}\n\n"
-            yield "data: [DONE]\n\n"
+            return
 
-    return Response(sse(), mimetype="text/event-stream")
+        # Gemini streaming
+        for chunk in client.models.generate_content_stream(
+            model=GEMINI_MODEL,
+            contents=message,
+        ):
+            if chunk.text:
+                # Keep it simple: plain text SSE chunks
+                yield f"data: {chunk.text}\n\n"
+
+        yield "data: [DONE]\n\n"
+
+    return Response(_stream(), mimetype="text/event-stream")
 
 
 if __name__ == "__main__":
-    # For local dev only (Render/production should use gunicorn)
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")), debug=True)
+    # Run dev server
+    app.run(host="0.0.0.0", port=5000, debug=True)
